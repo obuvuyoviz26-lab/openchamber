@@ -8,7 +8,7 @@ import { SEMANTIC_TYPOGRAPHY, getTypographyVariable, type SemanticTypographyKey 
 import type { ShortcutCombo } from '@/lib/shortcuts';
 import type { DraftStarterRef } from '@/lib/draftStarters';
 import type { CustomProviderIcon } from '@/lib/customProviderIcons';
-import { DEFAULT_MONO_FONT, DEFAULT_UI_FONT, type MonoFontOption, type UiFontOption } from '@/lib/fontOptions';
+import { DEFAULT_MONO_FONT, DEFAULT_UI_FONT, DEFAULT_UI_FONT_WEIGHT, type MonoFontOption, type UiFontOption, type UiFontWeight } from '@/lib/fontOptions';
 import { getStoredMobileKeyboardMode, type MobileKeyboardMode } from '@/lib/mobileKeyboardMode';
 import type { TerminalShell } from '@/lib/api/types';
 import type { PermissionMode } from './utils/permissionAutoAccept';
@@ -193,6 +193,8 @@ const CONTEXT_PANEL_MAX_PERSISTED_WIDTH = 10000;
 /** Per surface, not per panel: see clampContextPanelTabs. */
 const CONTEXT_PANEL_MAX_TABS = 12;
 const CONTEXT_PANEL_MAX_LABEL_LENGTH = 120;
+// Keep the most recently changed model preferences.
+const MAX_LAST_USED_EFFORTS = 512;
 const LEFT_SIDEBAR_DEFAULT_WIDTH = 280;
 /** Separates browser tabs opened in the same millisecond. */
 let browserTabSequence = 0;
@@ -249,7 +251,9 @@ const normalizeContextTargetPath = (value: string | null | undefined): string | 
     return null;
   }
 
-  return trimmed.replace(/\\/g, '/');
+  // Absolute file targets are already resolved; edge spaces belong to the name.
+  const path = /^(?:[\\/]|[A-Za-z]:[\\/])/.test(value) ? value : trimmed;
+  return path.replace(/\\/g, '/');
 };
 
 const normalizeContextTargetDirectory = (value: string | null | undefined): string | null => {
@@ -319,6 +323,8 @@ const normalizeContextPanelTabDedupeKey = (
   if (mode === 'diff') {
     return mode;
   }
+
+  if (mode === 'file' && dedupeKey === targetPath && targetPath) return targetPath;
 
   if (typeof dedupeKey === 'string') {
     const trimmed = dedupeKey.trim();
@@ -895,6 +901,11 @@ interface UIStore {
       every surface the zone shows, so neither switching folders nor
       switching surfaces moves the zone's edge; unset opens at the default. */
   contextZoneSizes: Partial<Record<ContextZone, number>>;
+  /** Expanded, a zone leaves the chat this many px (the bottom zone: of
+      height), as the user resized it there; unset leaves the default column.
+      Kept apart from `contextZoneSizes`, so the docked and the expanded zone
+      each keep the size the user gave them. */
+  contextZoneExpandedChatSizes: Partial<Record<ContextZone, number>>;
   /** Expanded collapsible sections of the in-chat work-status panel, by id. */
   workStatusExpandedSections: Record<string, boolean>;
   /**
@@ -1048,12 +1059,16 @@ interface UIStore {
   terminalFontSize: number;
   terminalShell: TerminalShell;
   terminalLoginShells: TerminalShell[];
+  /** A terminal or project action tab closes when its process exits; off keeps the exited output. */
+  terminalCloseOnExit: boolean;
   editorFontSize: number;
   uiFont: UiFontOption;
   monoFont: MonoFontOption;
   /** Family names used when `uiFont` / `monoFont` is `custom`. */
   customUiFont: string;
   customMonoFont: string;
+  /** Weight of regular interface text. */
+  uiFontWeight: UiFontWeight;
   padding: number;
   cornerRadius: number;
   inputBarOffset: number;
@@ -1071,6 +1086,11 @@ interface UIStore {
   /** Agents starred in the agent menu. While any of them is available, agent cycling (Tab) goes through those only. */
   favoriteAgents: string[];
   recentEfforts: Record<string, string[]>;
+  /**
+   * The last chosen thinking level per `provider/model`.
+   * `null` is an explicit Default; a missing key is no preference.
+   */
+  lastUsedEfforts: Record<string, string | null>;
 
   diffLayoutPreference: 'dynamic' | 'inline' | 'side-by-side';
   diffFileLayout: Record<string, 'inline' | 'side-by-side'>;
@@ -1115,6 +1135,8 @@ interface UIStore {
   showTerminalQuickKeysOnDesktop: boolean;
   /** Header session tabs (web/desktop), opt-in. Off keeps the plain session title. */
   sessionTabsEnabled: boolean;
+  /** Separate header tabs for each project root, worktree and space (`lib/sessionTabScope.ts`). */
+  sessionTabsPerWorkspace: boolean;
   showOpenCodeUpdateNotifications: boolean;
   agentControlToolEnabled: boolean;
   agentScheduleToolEnabled: boolean;
@@ -1128,7 +1150,11 @@ interface UIStore {
   agentMemoryToolEnabled: boolean;
   agentKnowledgeToolEnabled: boolean;
   agentNotifyToolEnabled: boolean;
+  agentImageToolEnabled: boolean;
+  /** `provider/model` the image tool draws with; empty until the user picks one. */
+  agentImageModel: string;
   agentRenderToolEnabled: boolean;
+  agentSecretToolEnabled: boolean;
   agentWorkflowToolEnabled: boolean;
   /** Whether OpenChamber's agent tools sit behind OpenCode's Code Mode instead of being direct tools. */
   agentToolsCodeMode: boolean;
@@ -1137,8 +1163,8 @@ interface UIStore {
   /** The permission mode the server writes onto each new top-level session. */
   permissionDefaultMode: PermissionMode;
   /**
-   * Whether this build has agent memory at all. Server-owned and not
-   * persisted: an unreleased feature must not come back from a stale cache.
+   * Whether an OpenChamber server backs agent memory here; false in VS Code.
+   * Server-owned and not persisted.
    */
   agentMemoryFeatureAvailable: boolean;
   /**
@@ -1246,6 +1272,7 @@ interface UIStore {
   toggleContextPanelExpanded: (directory: string, zone?: ContextZone) => void;
   /** Width for a side zone, height for the bottom one; shared by its surfaces and folders. */
   setContextZoneSize: (zone: ContextZone, size: number) => void;
+  setContextZoneExpandedChatSize: (zone: ContextZone, size: number) => void;
   /**
    * Places a surface in a zone for every project on this device. Where it is
    * on screen it goes along: the zone it left closes and the new one opens on it.
@@ -1347,11 +1374,13 @@ interface UIStore {
   setTerminalFontSize: (size: number) => void;
   setTerminalShell: (shell: TerminalShell) => void;
   setTerminalLoginShells: (shells: TerminalShell[]) => void;
+  setTerminalCloseOnExit: (value: boolean) => void;
   setEditorFontSize: (size: number) => void;
   setUiFont: (font: UiFontOption) => void;
   setMonoFont: (font: MonoFontOption) => void;
   setCustomUiFont: (family: string) => void;
   setCustomMonoFont: (family: string) => void;
+  setUiFontWeight: (weight: UiFontWeight) => void;
   setPadding: (size: number) => void;
   setCornerRadius: (radius: number) => void;
   setInputBarOffset: (offset: number) => void;
@@ -1379,6 +1408,7 @@ interface UIStore {
   addRecentAgent: (agentName: string) => void;
   toggleFavoriteAgent: (agentName: string) => void;
   addRecentEffort: (providerID: string, modelID: string, variant: string | undefined) => void;
+  rememberLastUsedEffort: (providerID: string, modelID: string, variant: string | null) => void;
   setDiffLayoutPreference: (mode: 'dynamic' | 'inline' | 'side-by-side') => void;
   /** The layout setting for every diff, dropping the per-file choices (the Changes header toggle). */
   setDiffLayoutForAllFiles: (mode: 'inline' | 'side-by-side') => void;
@@ -1399,6 +1429,7 @@ interface UIStore {
   setNotificationMode: (mode: 'always' | 'hidden-only') => void;
   setShowTerminalQuickKeysOnDesktop: (value: boolean) => void;
   setSessionTabsEnabled: (value: boolean) => void;
+  setSessionTabsPerWorkspace: (value: boolean) => void;
   setNotifyOnSubtasks: (value: boolean) => void;
   setDockBadgeEnabled: (value: boolean) => void;
   setAlwaysShowScrollbars: (value: boolean) => void;
@@ -1422,7 +1453,10 @@ interface UIStore {
   setAgentMemoryToolEnabled: (value: boolean) => void;
   setAgentKnowledgeToolEnabled: (value: boolean) => void;
   setAgentNotifyToolEnabled: (value: boolean) => void;
+  setAgentImageToolEnabled: (value: boolean) => void;
+  setAgentImageModel: (value: string) => void;
   setAgentRenderToolEnabled: (value: boolean) => void;
+  setAgentSecretToolEnabled: (value: boolean) => void;
   setAgentWorkflowToolEnabled: (value: boolean) => void;
   setAgentToolsCodeMode: (value: boolean) => void;
   setIsolatedSpacesEnabled: (value: boolean) => void;
@@ -1510,6 +1544,7 @@ export const useUIStore = create<UIStore>()(
         contextEditorVisible: true,
         contextEditorTreeWidth: 240,
         contextZoneSizes: {},
+        contextZoneExpandedChatSizes: {},
         workStatusExpandedSections: {},
         messageQueueExpanded: false,
         workStatusScrollTop: 0,
@@ -1595,11 +1630,13 @@ export const useUIStore = create<UIStore>()(
         terminalFontSize: 14,
         terminalShell: 'auto',
         terminalLoginShells: [],
+        terminalCloseOnExit: true,
         editorFontSize: 13,
         uiFont: DEFAULT_UI_FONT,
         monoFont: DEFAULT_MONO_FONT,
         customUiFont: '',
         customMonoFont: '',
+        uiFontWeight: DEFAULT_UI_FONT_WEIGHT,
         padding: 100,
         cornerRadius: 18,
         inputBarOffset: 0,
@@ -1614,6 +1651,7 @@ export const useUIStore = create<UIStore>()(
         recentAgents: [],
         favoriteAgents: [],
         recentEfforts: {},
+        lastUsedEfforts: {},
         diffLayoutPreference: 'inline',
         diffFileLayout: {},
         diffWrapLines: false,
@@ -1651,6 +1689,7 @@ export const useUIStore = create<UIStore>()(
 
         showTerminalQuickKeysOnDesktop: false,
         sessionTabsEnabled: false,
+        sessionTabsPerWorkspace: false,
         showOpenCodeUpdateNotifications: true,
         agentControlToolEnabled: true,
         agentScheduleToolEnabled: true,
@@ -1661,7 +1700,10 @@ export const useUIStore = create<UIStore>()(
         agentMemoryToolEnabled: false,
         agentKnowledgeToolEnabled: true,
         agentNotifyToolEnabled: false,
+        agentImageToolEnabled: false,
+        agentImageModel: '',
         agentRenderToolEnabled: true,
+        agentSecretToolEnabled: true,
         agentWorkflowToolEnabled: true,
         agentToolsCodeMode: false,
         isolatedSpacesEnabled: false,
@@ -2265,6 +2307,11 @@ export const useUIStore = create<UIStore>()(
           set((state) => ({ contextZoneSizes: { ...state.contextZoneSizes, [zone]: clampContextZoneSize(zone, size) } }));
         },
 
+        setContextZoneExpandedChatSize: (zone, size) => {
+          if (!Number.isFinite(size)) return;
+          set((state) => ({ contextZoneExpandedChatSizes: { ...state.contextZoneExpandedChatSizes, [zone]: Math.max(0, Math.round(size)) } }));
+        },
+
         moveContextSurfaceToZone: (mode, zone) => {
           set((state) => {
             const from = zoneOfMode(state.contextSurfaceZones, mode);
@@ -2780,6 +2827,10 @@ export const useUIStore = create<UIStore>()(
           set({ terminalLoginShells: [...new Set(shells)] });
         },
 
+        setTerminalCloseOnExit: (value) => {
+          set({ terminalCloseOnExit: value });
+        },
+
         setEditorFontSize: (size) => {
           const rounded = Math.round(size);
           const clamped = Math.max(9, Math.min(32, rounded));
@@ -2800,6 +2851,10 @@ export const useUIStore = create<UIStore>()(
 
         setCustomMonoFont: (family) => {
           set({ customMonoFont: family.slice(0, 100) });
+        },
+
+        setUiFontWeight: (weight) => {
+          set({ uiFontWeight: weight });
         },
 
         setPadding: (size) => {
@@ -3129,8 +3184,8 @@ export const useUIStore = create<UIStore>()(
         },
 
         addRecentEffort: (providerID, modelID, variant) => {
-          const provider = typeof providerID === 'string' ? providerID.trim() : '';
-          const model = typeof modelID === 'string' ? modelID.trim() : '';
+          const provider = providerID.trim();
+          const model = modelID.trim();
           if (!provider || !model) {
             return;
           }
@@ -3147,6 +3202,26 @@ export const useUIStore = create<UIStore>()(
                 ...state.recentEfforts,
                 [key]: [normalizedVariant, ...filtered].slice(0, 5),
               },
+            };
+          });
+        },
+
+        rememberLastUsedEffort: (providerID, modelID, variant) => {
+          const provider = typeof providerID === 'string' ? providerID.trim() : '';
+          const model = typeof modelID === 'string' ? modelID.trim() : '';
+          if (!provider || !model) {
+            return;
+          }
+          const key = `${provider}/${model}`;
+          const normalizedVariant = variant?.trim() || null;
+          set((state) => {
+            if (state.lastUsedEfforts[key] === normalizedVariant) {
+              return state;
+            }
+            const entries = Object.entries(state.lastUsedEfforts).filter(([entryKey]) => entryKey !== key);
+            entries.push([key, normalizedVariant]);
+            return {
+              lastUsedEfforts: Object.fromEntries(entries.slice(-MAX_LAST_USED_EFFORTS)),
             };
           });
         },
@@ -3217,6 +3292,10 @@ export const useUIStore = create<UIStore>()(
           set({ sessionTabsEnabled: value });
         },
 
+        setSessionTabsPerWorkspace: (value) => {
+          set({ sessionTabsPerWorkspace: value });
+        },
+
         setNotifyOnSubtasks: (value) => {
           set({ notifyOnSubtasks: value });
         },
@@ -3278,8 +3357,17 @@ export const useUIStore = create<UIStore>()(
         setAgentNotifyToolEnabled: (value) => {
           set({ agentNotifyToolEnabled: value });
         },
+        setAgentImageToolEnabled: (value) => {
+          set({ agentImageToolEnabled: value });
+        },
+        setAgentImageModel: (value) => {
+          set({ agentImageModel: value });
+        },
         setAgentRenderToolEnabled: (value) => {
           set({ agentRenderToolEnabled: value });
+        },
+        setAgentSecretToolEnabled: (value) => {
+          set({ agentSecretToolEnabled: value });
         },
         setAgentWorkflowToolEnabled: (value) => {
           set({ agentWorkflowToolEnabled: value });
@@ -3726,6 +3814,7 @@ export const useUIStore = create<UIStore>()(
           contextEditorVisible: state.contextEditorVisible,
           contextEditorTreeWidth: state.contextEditorTreeWidth,
           contextZoneSizes: state.contextZoneSizes,
+          contextZoneExpandedChatSizes: state.contextZoneExpandedChatSizes,
           workStatusExpandedSections: state.workStatusExpandedSections,
           messageQueueExpanded: state.messageQueueExpanded,
           workStatusScrollTop: state.workStatusScrollTop,
@@ -3775,11 +3864,13 @@ export const useUIStore = create<UIStore>()(
           terminalFontSize: state.terminalFontSize,
           terminalShell: state.terminalShell,
           terminalLoginShells: state.terminalLoginShells,
+          terminalCloseOnExit: state.terminalCloseOnExit,
           editorFontSize: state.editorFontSize,
           uiFont: state.uiFont,
           monoFont: state.monoFont,
           customUiFont: state.customUiFont,
           customMonoFont: state.customMonoFont,
+          uiFontWeight: state.uiFontWeight,
           padding: state.padding,
           cornerRadius: state.cornerRadius,
           favoriteModels: state.favoriteModels,
@@ -3792,6 +3883,7 @@ export const useUIStore = create<UIStore>()(
           recentAgents: state.recentAgents,
           favoriteAgents: state.favoriteAgents,
           recentEfforts: state.recentEfforts,
+          lastUsedEfforts: state.lastUsedEfforts,
           diffLayoutPreference: state.diffLayoutPreference,
           diffWrapLines: state.diffWrapLines,
           diffHideWhitespace: state.diffHideWhitespace,
@@ -3804,6 +3896,7 @@ export const useUIStore = create<UIStore>()(
           notificationMode: state.notificationMode,
           showTerminalQuickKeysOnDesktop: state.showTerminalQuickKeysOnDesktop,
           sessionTabsEnabled: state.sessionTabsEnabled,
+          sessionTabsPerWorkspace: state.sessionTabsPerWorkspace,
           notifyOnSubtasks: state.notifyOnSubtasks,
           dockBadgeEnabled: state.dockBadgeEnabled,
           alwaysShowScrollbars: state.alwaysShowScrollbars,
@@ -3825,7 +3918,10 @@ export const useUIStore = create<UIStore>()(
           agentMemoryToolEnabled: state.agentMemoryToolEnabled,
           agentKnowledgeToolEnabled: state.agentKnowledgeToolEnabled,
           agentNotifyToolEnabled: state.agentNotifyToolEnabled,
+          agentImageToolEnabled: state.agentImageToolEnabled,
+          agentImageModel: state.agentImageModel,
           agentRenderToolEnabled: state.agentRenderToolEnabled,
+          agentSecretToolEnabled: state.agentSecretToolEnabled,
           agentWorkflowToolEnabled: state.agentWorkflowToolEnabled,
           agentToolsCodeMode: state.agentToolsCodeMode,
           isolatedSpacesEnabled: state.isolatedSpacesEnabled,

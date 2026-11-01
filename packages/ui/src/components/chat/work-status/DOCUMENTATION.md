@@ -47,7 +47,30 @@ switched on, room beside the chat (`roomy`, see below), and something to
 show. It stays reserved while the context panel covers it, so closing the
 panel goes straight back to the card's column instead of to nothing first.
 
+When the chat area also fits the context panel (`roomyBesidePanel`), the card
+keeps its column beside the open panel (`besidePanel`). The slot then grows
+to the panel plus the card's column, the card's host anchors to the slot's
+start and the panel card is offset past it, so the card stays between the
+chat and the panel. Opening the panel slides it in from the window's edge
+while the card moves with the chat's edge; closing reverses that. The
+answer is known while the panel is closed too, so the commit that opens it
+already animates to the final width.
+
+The card has the lowest priority in the row: it claims no room from the left
+zone and never makes the session sidebar fold. A panel dragged wider stops
+where the chat would drop under its own minimum next to the card, and the card
+yields once the panel is released wider than it fits beside.
+
 The overlay form stays inside the chat column in `ChatContainer`.
+
+### Why the card docks beside the panel instead of floating over the chat
+
+A pinned card that floats over the transcript while a side panel is open was
+weighed against it. Floating covers the transcript it reports on and needs an
+opaque surface over moving text plus a rule for narrow windows. Docking uses
+room the window already has and adds no setting: where the room is missing,
+the card yields exactly as it did before, and the header still offers the
+overlay.
 
 ## Visibility
 
@@ -56,15 +79,23 @@ The overlay form stays inside the chat column in `ChatContainer`.
 - the user switched it off;
 - the runtime is mobile or VS Code (the phone shows the sections in its own
   tab, see below);
-- the context panel is open for the directory the app is effectively on —
-  looked up through `useEffectiveDirectory` and `normalizeContextPanelDirectoryKey`,
-  the same key the rail and the panel use. It is deliberately **not** the
-  directory this panel reports about: a managed Chat reports about none, and
-  that empty key answered "closed" for a context panel that was plainly open;
 - the row cannot fit `WORK_STATUS_MIN_CHAT_WIDTH` of transcript alongside
-  `WORK_STATUS_PANEL_WIDTH` of panel. Only that threshold decision is state
-  (`roomy`); the width itself is not, because it changes on every frame of a
-  sidebar animation and storing it re-rendered the whole chat each frame.
+  `WORK_STATUS_PANEL_WIDTH` of panel. Only the threshold decisions are state
+  (`roomy`, `roomyBesidePanel`); the width itself is not, because it changes
+  on every frame of a sidebar animation and storing it re-rendered the whole
+  chat each frame;
+- the right zone's context panel is open and the row cannot also fit that
+  panel at its own width (`sideZoneWidth`: the zone's stored size, or the tree
+  width for Files showing only its tree), or the panel is expanded. The panel
+  is looked up for the directory the app is effectively on, through
+  `useEffectiveDirectory` and `normalizeContextPanelDirectoryKey`, the same
+  key the rail and the panel use. It is deliberately **not** the directory
+  this panel reports about: a managed Chat reports about none, and that empty
+  key answered "closed" for a context panel that was plainly open.
+
+The panel's width comes from the store, never from the DOM: it is the user's
+setting, so a resize or a surface switch moves the threshold and the last
+area reading is re-decided before paint.
 
 `ChatContainer` additionally suppresses it in mini-chat and in expanded-input
 mode. It remains available on a new-session draft: when the draft targets a
@@ -158,10 +189,10 @@ which requests only providers enabled for this panel.
 | Workflows | `useSessionWorkflowRuns` (`lib/workflows/store.ts`): the session's runs read once from the server, then kept current by `openchamber:workflow-run` events | only in builds with workflows |
 | Usage | `components/usage/usageGroups.ts` over `useQuotaStore` | grouping shared with the mobile popover; presentation is not |
 | Linked threads | `lib/linkedIssues.ts` over session metadata; state from tracked items | written by the flows that attach an issue or PR, and removable from the row; a linked PR that is also the checked-out branch's PR shows the branch summary, as its sidebar row does |
-| Turn stats | `telemetry.ts` over `useSessionMessageRecords` | computed while authoritatively idle, including when collapsed so the headline stays current; either rate above 5,000 tok/s is reported as unknown (see the two-rate description below) |
+| Turn stats | `telemetry.ts` over `useSessionMessageRecords` | computed while authoritatively idle, including when collapsed; active mounts read warm records once for the previous turn; either rate above 5,000 tok/s is reported as unknown (see the two-rate description below) |
 | Keep-warm switch | `useSessionWarmingStore`, mirrored from the server's `lib/session-warming` | on the Context row, shown only while Settings chose per-session warming and for a root session outside an isolated space; the tooltip's countdown ticks only while it is open |
 | Goal | `useSessionGoal` | respects the Settings toggle |
-| MCP | `useMcpStore` | connect/disconnect reuses the dropdown's actions |
+| MCP | `useMcpStore` | the switch reuses the dropdown's `setEnabled` |
 | Pinned messages | `getContextObligatoryMessages` + `state.part`, else one `getSessionMessage` read | see below |
 | Todos | live `state.todo[sessionId]`, persisted fallback | live channel wins |
 
@@ -208,7 +239,11 @@ The section follows Usage by default and reuses the panel's existing rows. Only 
 has an icon; metric rows use labels and values without leading icons. It
 reads already-loaded records without fetching history. The newest turn needs a
 preceding user message and completed assistant steps. A truncated or unfinished
-turn has no whole-turn result; later materialization can supply it.
+turn has no whole-turn result; later materialization can supply it. A newest
+user message with no reply yet arrives while the session still reports idle, so
+the section computes the turn before it instead and flags it as the previous
+turn. Computing nothing there would commit an empty result just before the
+session turns busy and blank the section for the whole run.
 
 Two rates answer different questions. Response speed uses the final assistant
 message's output tokens divided by the union of its nonempty text intervals.
@@ -249,15 +284,29 @@ portal outside the panel's scroller. Tooltips explain the measurement in every l
 compact input/output arrows; its tooltip gives full counts and explains that
 input excludes cached tokens and output includes reasoning across all steps.
 
-Records subscriptions and aggregation stop while busy, retrying, or awaiting
+Records subscriptions stop while busy, retrying, or awaiting
 status authority. Explicit idle events or a successful directory status snapshot
 allow computation even when collapsed: the response-speed headline remains visible
 and updates when a turn completes, after a remount, or when idle records change.
 The collapsed body stays unmounted. One component-owned committed result keeps the
-headline and rows stable during the next active turn. Its identity includes
+headline and rows stable during the next active turn. Whenever the shown numbers
+belong to an earlier turn (a pending prompt, or a busy or retrying session), the
+header says "Previous turn", followed by the response speed when there is one.
+Opening or reopening the section mid-run reads already-loaded, revert-filtered
+records once per scope, without fetching history or subscribing to streaming
+updates. It excludes the entire newest user-bounded turn, even if some of its
+assistant steps have completed. Missing or incomplete previous history shows no
+numbers until idle. The retained result's identity includes
 runtime, normalized directory and session. Scope changes discard it; fresh empty
 or reverted records clear it. There is no global message-ID cache. Corrections
 to existing message/part identities invalidate the current result.
+
+### Why active mounts read history once
+
+The mobile drawer unmounts its sections when closed, so component retention alone
+loses the previous turn on reopen. One warm-store snapshot recovers that turn
+without adding streaming work or history requests. The newest user-bounded turn
+is excluded because a completed tool step does not prove that turn has finished.
 
 ### Context usage has its own computation, on purpose
 
@@ -309,10 +358,23 @@ for it.
 
 Pins are most useful on a long session — which is exactly when the pinned
 message sits before the loaded part of the transcript. Session metadata keeps
-only the pin's id, time and role, so a pin that is not loaded reads its one
+the pin's id, time, role and owning `sessionID`. A child accepts only its own
+explicitly owned pins. It accepts a legacy ownerless pin only when its message
+was created strictly after the child; missing session ids and incomplete child
+timestamps fail closed. Root sessions, including user forks, keep inherited pins.
+A pin that is not loaded reads its one
 message from OpenCode (`opencodeClient.getSessionMessage`) for the row's text.
-No session is materialised for it, a loaded pin costs nothing, and a failed
-read leaves the placeholder until the section mounts again.
+That read targets only the displayed session and never walks to a parent, and the
+row keeps only a text part whose session and message ids match the pin, so a
+parent's text cannot supply the label. No session is materialised for it, a loaded pin
+costs nothing, and a failed read leaves the placeholder until the section mounts
+again.
+
+### Why pin ownership filtering applies only to child sessions
+
+Child and subagent sessions must not display parent pins. User forks retain
+their existing pin inheritance and compaction cursor. Copied messages receive
+new ids, so mapping inherited pins to forked messages needs a separate change.
 
 ### PR status is deliberately read-only
 
@@ -591,7 +653,7 @@ Rows that name something the app can already show are buttons:
 | Subagent | that child session's chat tab, read-only |
 | Goal (row) | the composer's own `SessionGoalDialog` |
 | Goal (pause/resume) | `setSessionGoalStatus(sessionId, directory, status)` |
-| MCP switch | connects/disconnects the server |
+| MCP switch | turns the server on or off in its config file (`useMcpStore.setEnabled`) |
 | MCP status | the state doubles as the button that reconnects |
 | Pinned (pin icon) | unpins the message |
 | Pinned (text) | jumps the transcript to that message |
@@ -672,6 +734,19 @@ is deliberately user-initiated: an agent links but never removes, so it cannot
 drop a link the user set (`packages/web/server/lib/openchamber-sessions/session-link.js`).
 A failed removal reports `chat.workStatus.linkedIssues.unlinkFailed` rather than
 leaving the row looking removed.
+
+Before the close control sits a copy-link control (`useCopyReferenceLink`, the
+same one the Tracker preview's header uses). It shows on hover or focus inside
+the row, and always on a coarse pointer, which has no hover: at rest a row
+keeps one action, and the copy is confirmed by a toast since nothing on screen
+changes.
+
+### Why the copy control takes no space at rest and not a reserved slot
+
+A slot kept for it cut every linked title short by an icon's width, though the
+control is used now and then. It is out of the layout until the row is hovered
+or focused, so the title is full width at rest and narrows only under the
+pointer.
 
 Stored in session metadata as a **snapshot** (`lib/linkedIssues.ts`, namespace
 `openchamber.linked_issues`), persisted through the same server-owned metadata

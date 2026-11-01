@@ -20,17 +20,20 @@ import {
 } from '@/stores/useGlobalSessionsStore';
 import { createSessionLineage } from '@/stores/sessionLineage';
 import { useQuotaStore } from '@/stores/useQuotaStore';
-import { QUOTA_PROVIDERS, formatWindowLabel, formatQuotaValueLabel } from '@/lib/quota';
+import { QUOTA_PROVIDERS, formatWindowLabel, formatQuotaWindowValueLabel } from '@/lib/quota';
+import { formatMessage, useI18nStore } from '@/lib/i18n';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useGitStore } from '@/stores/useGitStore';
 import { useUIStore } from '@/stores/useUIStore';
+import { useSessionDisplayStore } from '@/stores/useSessionDisplayStore';
 import { resolveProjectForSessionDirectory, normalizeProjectPath } from '@/lib/projectResolution';
+import { isSessionDirectoryAdmitted } from '@/sync/session-admission-rule';
 import { CHAT_DRAFT_PROJECT_ID, isChatDirectoryPath } from '@/lib/chatDirectories';
 import { isSpaceDirectory } from '@/lib/spaces/space-route';
-import { sessionHasSidebarRow } from '@/lib/sidebarSessionRows';
 import { isSessionPinned } from '@/lib/sessionPins';
 import { useSessionPinnedStore } from '@/stores/useSessionPinnedStore';
+import { sessionHasSidebarRow } from '@/lib/sidebarSessionRows';
 import { findWorktreeHoldingDirectory } from '@/lib/worktrees/worktreePaths';
 import type { ProjectEntry } from '@/lib/api/types';
 import type { WorktreeMetadata } from '@/types/worktree';
@@ -90,8 +93,9 @@ type TraySnapshot = {
   // dropdown (same "configured to show" rule as the header/mobile). Empty
   // groups → the tray omits the Usage submenu entirely.
   usage: TrayUsage;
-  // Number of chats (root sessions) with unseen activity, for the macOS dock
-  // badge. 0 when the user disabled the badge — the main process clears it.
+  // Number of chats (root sessions with a sidebar row) with unseen activity,
+  // for the macOS dock badge. 0 when the user disabled the badge — the main
+  // process clears it.
   dockBadgeCount: number;
 };
 
@@ -183,6 +187,8 @@ const resolveSessionSubtitle = (
 // user enabled for the dropdown AND that report as configured. Window rows only
 // (the headline limits) — model breakdowns stay in the full UI.
 const buildUsage = (): TrayUsage => {
+  const { dictionary } = useI18nStore.getState();
+  const t = (key: Parameters<typeof formatMessage>[1], params?: Parameters<typeof formatMessage>[2]) => formatMessage(dictionary, key, params);
   const { results, dropdownProviderIds, displayMode } = useQuotaStore.getState();
   const mode: TrayUsage['mode'] = displayMode === 'remaining' ? 'remaining' : 'usage';
   if (!dropdownProviderIds.length) return { mode, groups: [] };
@@ -197,7 +203,7 @@ const buildUsage = (): TrayUsage => {
     const rows: TrayUsageRow[] = [];
     for (const [label, window] of Object.entries(result.usage?.windows ?? {})) {
       const percent = mode === 'remaining' ? window.remainingPercent : window.usedPercent;
-      rows.push({ label: formatWindowLabel(label), value: formatQuotaValueLabel(window.valueLabel, percent) });
+      rows.push({ label: formatWindowLabel(label), value: formatQuotaWindowValueLabel(window, percent, t) });
     }
 
     const status = !result.ok && result.error
@@ -314,11 +320,52 @@ const buildSnapshot = (instanceName: string, includeTray: boolean): TraySnapshot
     lineage.descendantsOf(rootId, 'active').map((session) => session.id)
   );
 
+  const projects = useProjectsStore.getState().projects;
+  const worktreesByProject = useSessionUIStore.getState().availableWorktreesByProject;
+
+  // The tray and the dock badge cover the sessions that have a sidebar row
+  // (`sessionHasSidebarRow`). Sessions from unconfigured directories (an eval
+  // run in /tmp, a removed project, a /btw fork) have none, cannot be opened
+  // or removed from there, so they would take the tray's limited slots and
+  // hold a dock count the user has no way to clear. Pending approvals use the
+  // same admission rule below.
+  const pinnedIds = useSessionPinnedStore.getState().ids;
+  type Sections = { chats: boolean; pinned: boolean; work: boolean };
+  const hasRowIn = (session: Session, sections: Sections): boolean => {
+    const directory = resolveGlobalSessionDirectory(session);
+    const isAdmitted = isSessionDirectoryAdmitted(directory, projects, worktreesByProject);
+    // A managed chat keeps its identity when its directory no longer sits under
+    // the chats root, so the project id identifies it too. Only the Chats section
+    // lists a chat: the Pinned and In work zones leave chats out.
+    if (isChatDirectoryPath(directory) || session.projectID === CHAT_DRAFT_PROJECT_ID) {
+      return sessionHasSidebarRow(session, { isAdmitted, isPlaced: sections.chats, isPinned: false, zones: { pinned: false, work: false } });
+    }
+    return sessionHasSidebarRow(session, {
+      isAdmitted,
+      isPlaced: isSpaceDirectory(directory)
+        || resolveProjectForSessionDirectory(projects, worktreesByProject, directory) !== null,
+      isPinned: isSessionPinned(pinnedIds, session.directory, session.id),
+      zones: sections,
+    });
+  };
+  // The badge counts only rows the sidebar renders now: with the Chats,
+  // Pinned or In work section hidden, a session only that section lists has no
+  // row to read. The tray list keeps such a session, because its tray row
+  // opens it directly.
+  const display = useSessionDisplayStore.getState();
+  const shownSections: Sections = {
+    chats: display.showChatsSection,
+    pinned: display.showPinnedSection,
+    work: useUIStore.getState().sessionWorkEnabled && display.showWorkSection,
+  };
+  const allSections: Sections = { chats: true, pinned: true, work: true };
+
   // Count the full root list, independently of the tray's visibility and limit.
-  const ui = useUIStore.getState();
   // Only top-level sessions are ever unread (`isSessionUnread`); a subtask
   // reports to its parent.
-  const dockBadgeCount = ui.dockBadgeEnabled ? allSessions.filter(isSessionUnread).length : 0;
+  const dockBadgeCount = useUIStore.getState().dockBadgeEnabled
+    ? allSessions.filter((session) => isSessionUnread(session) && hasRowIn(session, shownSections)).length
+    : 0;
   if (!includeTray) {
     return { sessions: [], approvals: [], instanceName, usage: { mode: 'usage', groups: [] }, dockBadgeCount };
   }
@@ -347,32 +394,9 @@ const buildSnapshot = (instanceName: string, includeTray: boolean): TraySnapshot
     return 'idle';
   };
 
-  const projects = useProjectsStore.getState().projects;
-  const worktreesByProject = useSessionUIStore.getState().availableWorktreesByProject;
-
-  // The tray is a short recent-work list, not a dump of everything the store
-  // keeps: a session belongs here when it has a sidebar row
-  // (`sessionHasSidebarRow`). Sessions from unconfigured directories (an eval
-  // run in /tmp, a deleted scratch folder) have none, cannot be opened or
-  // removed from there, and would otherwise take the tray's limited slots.
-  // Pending approvals stay listed below regardless.
-  const pinnedIds = useSessionPinnedStore.getState().ids;
-  const isPlacedBySidebar = (session: Session): boolean => {
-    const directory = resolveGlobalSessionDirectory(session);
-    // A managed chat keeps its identity when its directory no longer sits under
-    // the chats root, so the project id admits it too.
-    if (isChatDirectoryPath(directory) || session.projectID === CHAT_DRAFT_PROJECT_ID) return true;
-    if (isSpaceDirectory(directory)) return true;
-    return resolveProjectForSessionDirectory(projects, worktreesByProject, directory) !== null;
-  };
-  const hasSidebarRow = (session: Session): boolean => sessionHasSidebarRow(session, {
-    isPlaced: isPlacedBySidebar(session),
-    isPinned: isSessionPinned(pinnedIds, session.directory, session.id),
-  });
-
   const sessions: TraySession[] = allSessions
     .filter((s) => s?.id && !s.parentID) // root rows; sub-session work rolls up
-    .filter(hasSidebarRow)
+    .filter((session) => hasRowIn(session, allSections))
     .slice()
     .sort(compareSessionOrder)
     .slice(0, MAX_SESSIONS)
@@ -411,7 +435,11 @@ const buildSnapshot = (instanceName: string, includeTray: boolean): TraySnapshot
     }
   }
 
-  return { sessions, approvals, instanceName, usage: buildUsage(), dockBadgeCount };
+  return {
+    sessions,
+    approvals: approvals.filter((approval) => isSessionDirectoryAdmitted(approval.directory, projects, worktreesByProject)),
+    instanceName, usage: buildUsage(), dockBadgeCount,
+  };
 };
 
 export const useTraySync = (): void => {
@@ -447,7 +475,21 @@ export const useTraySync = (): void => {
 
     const unsubscribeGlobal = useGlobalSessionsStore.subscribe(() => scheduleFlush());
     const unsubscribeUI = useUIStore.subscribe((state, previous) => {
-      if (state.dockBadgeEnabled !== previous.dockBadgeEnabled) {
+      if (state.dockBadgeEnabled !== previous.dockBadgeEnabled
+        || state.sessionWorkEnabled !== previous.sessionWorkEnabled) {
+        scheduleFlush();
+      }
+    });
+    // Projects, discovered worktrees, pins and the shown sections decide which
+    // sessions have a sidebar row, so they move the badge as well as the tray
+    // list and its "project · branch" subtitles (deduped, so cheap).
+    const unsubscribeProjects = useProjectsStore.subscribe(() => scheduleFlush());
+    const unsubscribeWorktrees = useSessionUIStore.subscribe(() => scheduleFlush());
+    const unsubscribePins = useSessionPinnedStore.subscribe(() => scheduleFlush());
+    const unsubscribeSections = useSessionDisplayStore.subscribe((state, previous) => {
+      if (state.showChatsSection !== previous.showChatsSection
+        || state.showPinnedSection !== previous.showPinnedSection
+        || state.showWorkSection !== previous.showWorkSection) {
         scheduleFlush();
       }
     });
@@ -456,6 +498,10 @@ export const useTraySync = (): void => {
       if (flushTimer !== null) window.clearTimeout(flushTimer);
       unsubscribeGlobal();
       unsubscribeUI();
+      unsubscribeProjects();
+      unsubscribeWorktrees();
+      unsubscribePins();
+      unsubscribeSections();
     };
 
     if (!trayEnabled) {
@@ -508,10 +554,6 @@ export const useTraySync = (): void => {
     }
     rebindStores();
 
-    // Project labels and discovered worktrees feed the "project · branch"
-    // subtitle; refresh the tray when they change (deduped, so cheap).
-    const unsubscribeProjects = useProjectsStore.subscribe(() => scheduleFlush());
-    const unsubscribeWorktrees = useSessionUIStore.subscribe(() => scheduleFlush());
     const unsubscribeGit = useGitStore.subscribe(() => scheduleFlush());
     // Cross-project status map: fed live by the sync dispatcher from the global
     // event stream and seeded from the host by the root global-sessions poll.
@@ -542,8 +584,6 @@ export const useTraySync = (): void => {
     return () => {
       stopBadgeSync();
       window.clearInterval(interval);
-      unsubscribeProjects();
-      unsubscribeWorktrees();
       unsubscribeGit();
       unsubscribeGlobalStatus();
       unsubscribeGlobalRequests();

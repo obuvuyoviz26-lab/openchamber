@@ -10,6 +10,7 @@ import {
   useGlobalSessionStatusStore,
   replaceGlobalSessionStatusById,
   resolveSessionTurnActivity,
+  subscribeSessionStatusTransitions,
 } from "./global-session-status"
 import { resetSessionOrdering, useSessionOrderingStore } from "./session-ordering"
 import { resetSessionActivityTiming, useSessionActivityTimingStore } from "./session-activity-timing"
@@ -23,6 +24,33 @@ beforeEach(() => {
 
 describe("global session status index", () => {
   const activeSessionIds = (): ReadonlySet<string> => useGlobalSessionStatusStore.getState().activeSessionIds
+
+  test("transition listeners see intermediate activity before a single batch publication and unsubscribe", () => {
+    const transitions: string[][] = []
+    let publications = 0
+    const unsubscribeStore = useGlobalSessionStatusStore.subscribe(() => { publications += 1 })
+    const unsubscribe = subscribeSessionStatusTransitions((_id, active) => {
+      transitions.push([...active])
+    })
+    try {
+      applyGlobalSessionStatusEvents("/repo", [
+        { type: "session.status", properties: { sessionID: "parent", status: { type: "busy" } } },
+        { type: "session.status", properties: { sessionID: "child", status: { type: "busy" } } },
+        { type: "session.idle", properties: { sessionID: "parent" } },
+        { type: "session.idle", properties: { sessionID: "child" } },
+      ])
+      expect(transitions).toEqual([["parent"], ["parent", "child"], ["child"], []])
+      expect(publications).toBe(1)
+      unsubscribe()
+      applyGlobalSessionStatusEvent("/repo", {
+        type: "session.idle", properties: { sessionID: "parent" },
+      })
+      expect(transitions).toHaveLength(4)
+    } finally {
+      unsubscribe()
+      unsubscribeStore()
+    }
+  })
 
   test("a parent directory snapshot cannot settle a worktree session merely contained in its list", () => {
     const sessions = ["/repo", "/tree"].map((directory) => ({
@@ -245,6 +273,10 @@ describe("what a session row says keeps its turn open", () => {
     expect(resolveSessionTurnActivity("subagent", false, true)).toBe("subagent")
     expect(resolveSessionTurnActivity(null, false, true)).toBe("shell")
     expect(resolveSessionTurnActivity(null, false, false)).toBeNull()
+    // An agent waiting on its pull request reads as working, after anything that really runs.
+    expect(resolveSessionTurnActivity(null, false, false, true)).toBe("pullRequest")
+    expect(resolveSessionTurnActivity(null, false, true, true)).toBe("shell")
+    expect(resolveSessionTurnActivity("running", false, false, true)).toBe("running")
   })
 })
 

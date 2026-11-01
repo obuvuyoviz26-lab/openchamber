@@ -79,37 +79,19 @@ describe('Gitea mappers', () => {
     }
   });
 
-  it('resolves a relative target_url against the instance origin', () => {
-    const combined = {
-      state: 'success',
-      sha: HEAD,
-      total_count: 1,
-      statuses: [{ id: 1, status: 'success', target_url: '/alice/app/actions/runs/3668/jobs/0', context: 'ci / test' }],
-    };
-    const ci = mapGiteaCI(combined, identity);
-    expect(ci.runs[0].detailsUrl).toBe(`${ORIGIN}/alice/app/actions/runs/3668/jobs/0`);
-  });
-
-  it('passes an absolute http(s) target_url through unchanged', () => {
-    const combined = {
-      state: 'success',
-      sha: HEAD,
-      total_count: 1,
-      statuses: [{ id: 1, status: 'success', target_url: 'https://forge.example.com/alice/app/actions/runs/1', context: 'ci / test' }],
-    };
-    const ci = mapGiteaCI(combined, identity);
-    expect(ci.runs[0].detailsUrl).toBe('https://forge.example.com/alice/app/actions/runs/1');
-  });
-
-  it('drops a non-URL target_url without throwing', () => {
-    const combined = {
-      state: 'success',
-      sha: HEAD,
-      total_count: 1,
-      statuses: [{ id: 1, status: 'success', target_url: 'run-42', context: 'ci / test' }],
-    };
-    const ci = mapGiteaCI(combined, identity);
-    expect(ci.runs[0].detailsUrl).toBeUndefined();
+  it('resolves a relative Actions target_url against the instance, keeping only an http(s) one', () => {
+    const status = fixtures.combinedStatus.statuses[0];
+    const run = (target_url) => mapGiteaCI({ statuses: [{ ...status, target_url }] }, identity).runs[0];
+    expect(run('/alice/app/actions/runs/1').detailsUrl).toBe(`${ORIGIN}/alice/app/actions/runs/1`);
+    expect(run(`${ORIGIN}/alice/app/actions/runs/1`).detailsUrl).toBe(`${ORIGIN}/alice/app/actions/runs/1`);
+    expect(run('https://ci.example.com/job/1').detailsUrl).toBe('https://ci.example.com/job/1');
+    expect(run('http://ci.example.com/job/1').detailsUrl).toBe('http://ci.example.com/job/1');
+    expect(run('run-42').detailsUrl).toBe(`${ORIGIN}/run-42`);
+    expect(run('javascript:alert(1)').detailsUrl).toBeUndefined();
+    expect(run('https://[').detailsUrl).toBeUndefined();
+    expect(run('').detailsUrl).toBeUndefined();
+    expect(run(undefined)).toMatchObject({ id: String(status.id), name: status.context, conclusion: 'success' });
+    expect(run(undefined).detailsUrl).toBeUndefined();
   });
 
   it('drops a relative target_url when the identity has no instance', () => {

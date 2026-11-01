@@ -2,12 +2,13 @@ import React from 'react';
 import type { ToolPopupContent } from '../message/types';
 import { isVSCodeRuntime } from '@/lib/desktop';
 import { runtimeFetch } from '@/lib/runtime-fetch';
+import { runtimeAssetsNeedHeaders } from '@/lib/runtime-asset';
 import { getRuntimeKey } from '@/lib/runtime-switch';
 import { refreshRuntimeUrlAuthToken } from '@/lib/runtime-auth';
 import { getRuntimeUrlResolver } from '@/lib/runtime-url';
 import { isFilePathWithinDirectory } from '@/lib/path-utils';
 import { isMarkdownDocumentReference, resolveMarkdownDocumentReference } from '@/components/views/files/previews/useMarkdownLocalAssets';
-import { getPreparedMarkdownImageUrl, isLocalMarkdownImageSource, prepareLocalMarkdownImages, resolveMarkdownImageSource, resolveWorkspaceMarkdownImageSource, type PreparedMarkdownImage } from './markdownImageAssets';
+import { getPreparedMarkdownImageUrl, isLocalMarkdownImageSource, loadMessageImageBlob, loadPreparedImageAsDataUrl, prepareLocalMarkdownImages, resolveMarkdownImageSource, resolveWorkspaceMarkdownImageSource, type PreparedMarkdownImage } from './markdownImageAssets';
 
 export type MarkdownDocumentAssets = {
   filePath: string;
@@ -16,7 +17,7 @@ export type MarkdownDocumentAssets = {
   colorScheme: 'light' | 'dark';
 };
 
-type GalleryImage = { source: string; filename: string; element: HTMLElement; resolve: () => Promise<string> };
+type GalleryImage = { source: string; filename: string; element: HTMLElement; resolve: () => Promise<string>; load: () => Promise<Blob> };
 // Parts of one message share the existing popup gallery. Entries live only while
 // their React-owned image is mounted and loaded, and retain no resolved URLs.
 const galleries = new Map<string, Set<GalleryImage>>();
@@ -126,9 +127,32 @@ export class MarkdownMediaOwner {
     const prepared = (await this.batch).get(source);
     this.check(signal);
     if (prepared?.status !== 'ready') throw new Error('Image is unavailable');
+    if (!video && runtimeAssetsNeedHeaders()) {
+      const url = await loadPreparedImageAsDataUrl(prepared, directory, signal);
+      this.check(signal);
+      return url;
+    }
     await refreshRuntimeUrlAuthToken();
     this.check(signal);
     return getPreparedMarkdownImageUrl(prepared, directory);
+  }
+
+  /**
+   * An image's own bytes, to save it from the viewer. A message's local image
+   * is read whole through its grant; a document's, already read, and an
+   * inline one come from their object or data URL. A remote image is not
+   * ours to read.
+   */
+  async load(source: string): Promise<Blob> {
+    const signal = this.controller.signal;
+    const { mode, directory, sessionId, messageId } = this.options;
+    if (mode === 'assistant' && !isVSCodeRuntime() && isLocalMarkdownImageSource(source)) {
+      if (!sessionId || !messageId) throw new Error('Missing media owner');
+      return loadMessageImageBlob({ source, directory, sessionId, messageId, signal });
+    }
+    const url = await this.resolve(source);
+    if (!/^(?:data|blob):/i.test(url)) throw new Error('Image cannot be saved');
+    return (await fetch(url, { signal })).blob();
   }
 
   addGallery(image: GalleryImage): () => void {
@@ -149,12 +173,12 @@ export class MarkdownMediaOwner {
     this.check(signal);
     const gallery = entries.flatMap((entry, index) => {
       const result = results[index];
-      return result?.status === 'fulfilled' ? [{ url: result.value, filename: entry.filename, element: entry.element }] : [];
+      return result?.status === 'fulfilled' ? [{ url: result.value, filename: entry.filename, element: entry.element, load: entry.load }] : [];
     });
     const index = gallery.findIndex((entry) => entry.element === element);
     const current = gallery[index];
     if (!current) return;
-    show({ open: true, title: current.filename, content: '', metadata: { tool: 'markdown-image-preview', filename: current.filename }, image: { url: current.url, filename: current.filename, gallery: gallery.map(({ url, filename }) => ({ url, filename })), index } });
+    show({ open: true, title: current.filename, content: '', metadata: { tool: 'markdown-image-preview', filename: current.filename }, image: { url: current.url, filename: current.filename, load: current.load, gallery: gallery.map(({ url, filename, load }) => ({ url, filename, load })), index } });
   }
 
   disconnect(): void {

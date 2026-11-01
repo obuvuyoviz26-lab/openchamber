@@ -4,6 +4,7 @@ import { startDiagnosticCapture } from '@/lib/diagnostics/capture';
 import { AppStartupOverlay } from '@/components/ui/AppStartupOverlay';
 import { MainLayout } from '@/components/layout/MainLayout';
 import { AppLinkConfirmDialog } from '@/components/chat/AppLinkConfirmDialog';
+import { SnippetQuickCreateDialog } from '@/components/snippets/SnippetQuickCreateDialog';
 import { SharedTrustConfirmDialog } from '@/components/projects/SharedTrustConfirmDialog';
 import { OpenCodeTrustDialog } from '@/components/projects/OpenCodeTrustDialog';
 import { FireworksProvider } from '@/contexts/FireworksContext';
@@ -47,15 +48,13 @@ import {
 } from '@/lib/desktopBoot';
 import type { RecoveryVariant } from '@/components/onboarding/DesktopConnectionRecovery';
 import { useSessionUIStore } from '@/sync/session-ui-store';
-import { openSessionLink } from '@/lib/router/openSessionFromRoute';
+import { openSession, openSessionLink } from '@/lib/router/openSessionFromRoute';
 import { parseRoute } from '@/lib/router';
 import { beginLastSessionRestore, type LastSessionRestoreResult } from '@/sync/last-session-restore';
 import { markSessionViewed } from '@/sync/notification-store';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
 import { opencodeClient } from '@/lib/opencode/client';
 import { getRuntimeKey, subscribeRuntimeEndpointChanged } from '@/lib/runtime-switch';
-import { useAutoReviewStore } from '@/stores/useAutoReviewStore';
-import { resumeAutoReviewRun } from '@/lib/reviewFlow';
 import { SyncProvider } from '@/sync/sync-context';
 import { ConfigUpdateOverlay } from '@/components/ui/ConfigUpdateOverlay';
 import { RuntimeAPIProvider } from '@/contexts/RuntimeAPIProvider';
@@ -308,24 +307,6 @@ function App({ apis }: AppProps) {
     });
   }, []);
 
-  const autoReviewResumeSignature = useAutoReviewStore((state) => {
-    const runtimeKey = getRuntimeKey();
-    return Object.values(state.runsByOriginalSessionID)
-      .filter((run) => run.status === 'running' && run.runtimeKey === runtimeKey)
-      .map((run) => `${run.originalSessionID}:${run.phase}:${run.lastForwardedMessageID ?? ''}:${run.expectedAssistantParentID ?? ''}`)
-      .sort()
-      .join('|');
-  });
-
-  React.useEffect(() => {
-    const runtimeKey = getRuntimeKey();
-    const runs = Object.values(useAutoReviewStore.getState().runsByOriginalSessionID)
-      .filter((run) => run.status === 'running' && run.runtimeKey === runtimeKey);
-    for (const run of runs) {
-      resumeAutoReviewRun(run.originalSessionID);
-    }
-  }, [autoReviewResumeSignature, runtimeEndpointEpoch]);
-
   React.useEffect(() => {
     document.documentElement.classList.toggle('wide-chat-layout', wideChatLayoutEnabled);
     return () => {
@@ -531,14 +512,9 @@ function App({ apis }: AppProps) {
         : null;
       const messageId = typeof detail?.messageId === 'string' ? detail.messageId.trim() || null : null;
       if (openSessionInOwningHostWindow(sessionId, String(detail?.runtimeKey ?? '').trim(), messageId)) return;
-      // A link (a desktop deep link, a link to this window's instance) carries
-      // no directory; the route opener resolves it from the global session
-      // list, as for a web link.
-      if (!directory) {
-        void openSessionLink(sessionId, messageId);
-        return;
-      }
-      void useSessionUIStore.getState().setCurrentSession(sessionId, directory);
+      // A session event carries the owning directory; a link carries none and
+      // lets the opener resolve it from the global session list.
+      void openSession(sessionId, { directory, messageId });
     };
 
     window.addEventListener('openchamber:open-session', handler as EventListener);
@@ -899,6 +875,7 @@ function App({ apis }: AppProps) {
                   {isDesktopRuntime ? <AppStartupOverlay ready={bootOutcomeKnown && bootViewIsMain} /> : null}
                   <Toaster />
                   <AppLinkConfirmDialog />
+                  <SnippetQuickCreateDialog />
                   <SharedTrustConfirmDialog />
                   <OpenCodeTrustDialog />
                   <ConfigUpdateOverlay />

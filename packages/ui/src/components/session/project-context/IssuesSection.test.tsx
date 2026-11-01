@@ -279,6 +279,8 @@ const { createRoot } = await import('react-dom/client');
 const { I18nProvider } = await import('@/lib/i18n');
 const { RuntimeAPIContext } = await import('@/contexts/runtimeAPIContext');
 const { usePendingComposerReferences } = await import('@/components/chat/composer/pendingComposerReferences');
+const { useSessionUIStore } = await import('@/sync/session-ui-store');
+const { getRuntimeKey } = await import('@/lib/runtime-switch');
 const { DEFAULT_ISSUE_FILTER } = await import('../../references/referencePickerItems');
 const { IssuesSection } = await import('./IssuesSection');
 const { issueToRepositoryReference } = await import('./issueReference');
@@ -357,7 +359,12 @@ beforeEach(() => {
   sourceControl.issueComments = async () => detailComments;
   sourceControl.referenceLabels = async () => [];
   sourceControl.referenceMilestones = async () => [];
-  usePendingComposerReferences.setState({ references: [] });
+  usePendingComposerReferences.setState({ pending: [] });
+  // No session and no draft by default; the attach tests name their target.
+  useSessionUIStore.setState({
+    currentSessionId: null,
+    newSessionDraft: { draftId: 0, open: false, directoryOverride: null, parentID: null, target: 'chat' },
+  });
 });
 
 afterEach(async () => {
@@ -455,25 +462,47 @@ test('the open issue shows its full body, its comments, its milestone and its la
   expect(text).toContain('choo');
 });
 
-test('attaching pushes a repository-issue composer reference', async () => {
+test('attaching pushes a repository-issue composer reference for the open session', async () => {
   list.items = [row];
   detailIssue = issue;
   detailComments = [comment];
+  useSessionUIStore.setState({ currentSessionId: 'session-attach' });
   await renderSection({ openIssueNumber: 7 });
   const attach = Array.from(host?.querySelectorAll('button') ?? [])
     .find((button) => button.textContent === 'Attach to this session');
   if (!attach) throw new Error('Attach button missing');
   await act(async () => { attach.click(); });
   await settle();
-  const pending = usePendingComposerReferences.getState().references;
+  const pending = usePendingComposerReferences.getState().pending;
   expect(pending).toHaveLength(1);
-  expect(pending[0]).toMatchObject({
+  expect(pending[0].target).toEqual({ kind: 'session', sessionId: 'session-attach' });
+  const [reference] = pending[0].references;
+  expect(reference).toMatchObject({
     kind: 'repository-issue',
     provider: 'gitea',
     number: 7,
     title: 'Pipelines time out',
   });
-  expect(pending[0].author).toEqual({ login: 'luffy', avatarUrl: 'https://gitea.test/avatar/1.png' });
+  expect(reference.author).toEqual({ login: 'luffy', avatarUrl: 'https://gitea.test/avatar/1.png' });
+});
+
+test('attaching in a new-session draft targets the draft, not a session', async () => {
+  list.items = [row];
+  detailIssue = issue;
+  detailComments = [comment];
+  useSessionUIStore.setState({
+    currentSessionId: 'session-other',
+    newSessionDraft: { draftId: 1, open: true, directoryOverride: null, parentID: null, target: 'chat', workDraftId: 'draft-attach' },
+  });
+  await renderSection({ openIssueNumber: 7 });
+  const attach = Array.from(host?.querySelectorAll('button') ?? [])
+    .find((button) => button.textContent === 'Attach to this session');
+  if (!attach) throw new Error('Attach button missing');
+  await act(async () => { attach.click(); });
+  await settle();
+  const pending = usePendingComposerReferences.getState().pending;
+  expect(pending).toHaveLength(1);
+  expect(pending[0].target).toEqual({ kind: 'draft', workDraftId: 'draft-attach', runtimeKey: getRuntimeKey() });
 });
 
 test('the detail maps onto the list row shape the attach path reads', () => {

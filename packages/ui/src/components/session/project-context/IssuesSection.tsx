@@ -20,14 +20,16 @@ import { useI18n } from '@/lib/i18n';
 import { openExternalUrl } from '@/lib/url';
 import { useRepositoryBinding } from '@/lib/source-control/repository-binding';
 import { effectiveRepositoryBinding } from '@/lib/source-control/types';
+import { getRuntimeKey } from '@/lib/runtime-switch';
 import { cn } from '@/lib/utils';
+import { useSessionUIStore } from '@/sync/session-ui-store';
 
 import { IssueFilterMenu, IssueFilterSelects } from '../../references/IssueFilterMenu';
 import { useChoiceOptions, type ChoiceOptionsState } from '../../references/issueFilterOptions';
 import { useRepositoryReadContext, useRepositoryReferenceList, useRepositoryReferenceProvider } from '../../references/referenceSources';
 import { labelColor, referenceNumberLabel, repositoryStateLook, type IssueFilter } from '../../references/referencePickerItems';
 import { resolveComposerReferences } from '../../references/resolveComposerReferences';
-import { usePendingComposerReferences } from '../../chat/composer/pendingComposerReferences';
+import { usePendingComposerReferences, type ComposerReferenceHandoff } from '../../chat/composer/pendingComposerReferences';
 import { KnowledgeEntryView } from './KnowledgeEntryView';
 import { issueToRepositoryReference } from './issueReference';
 
@@ -61,6 +63,10 @@ export const IssuesSection: React.FC<IssuesSectionProps> = ({ directory, filter,
   const context = readContext && readContext !== 'missing' ? readContext : null;
   const providerId = useRepositoryReferenceProvider(directory);
   const descriptor = useSourceControlProvider(providerId);
+
+  // The open session, when the chat shows one rather than a new-session draft;
+  // the chip lands on the composer it names, so a draft's chips wait for it.
+  const currentSessionId = useSessionUIStore((state) => (state.newSessionDraft?.open ? null : state.currentSessionId));
 
   const list = useRepositoryReferenceList({
     enabled: context !== null,
@@ -126,6 +132,13 @@ export const IssuesSection: React.FC<IssuesSectionProps> = ({ directory, filter,
 
   const attachToSession = (issue: Issue) => {
     if (!context) return;
+    const draft = useSessionUIStore.getState().newSessionDraft;
+    const target: ComposerReferenceHandoff | null = currentSessionId
+      ? { kind: 'session', sessionId: currentSessionId }
+      : draft?.open && draft.workDraftId
+        ? { kind: 'draft', workDraftId: draft.workDraftId, runtimeKey: getRuntimeKey() }
+        : null;
+    if (!target) return;
     void resolveComposerReferences(
       [{ source: 'repository', reference: issueToRepositoryReference(issue, context.primaryRemote), includeDiff: false }],
       {
@@ -135,7 +148,7 @@ export const IssuesSection: React.FC<IssuesSectionProps> = ({ directory, filter,
         trackerName: () => '',
       },
     ).then(({ references, failures }) => {
-      if (references.length > 0) usePendingComposerReferences.getState().push(references);
+      if (references.length > 0) usePendingComposerReferences.getState().push(references, target);
       const failure = failures[0];
       if (failure) toast.error(t('sourceBoard.error.attachFailed', { item: failure.label }), { description: failure.error });
     });
